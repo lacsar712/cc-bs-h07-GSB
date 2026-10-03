@@ -31,12 +31,7 @@ def claim_one(conn):
 
 
 def finish(conn, reading_id: int, microstrain: float) -> None:
-    from h07_extra_trap import on_judge, reason_for_skip
-    skipped = on_judge(microstrain)
-    if skipped == "":
-        verdict, reason = "", reason_for_skip()
-    else:
-        verdict, reason = judge_microstrain(microstrain)
+    verdict, reason = judge_microstrain(microstrain)
     conn.execute(
         """
         UPDATE strain_readings
@@ -46,6 +41,31 @@ def finish(conn, reading_id: int, microstrain: float) -> None:
         (verdict, reason, reading_id),
     )
     conn.commit()
+
+
+def repair_half_judged(conn) -> int:
+    """重判此前被旁路吞掉结论的已完成记录，补齐合格/越界，不留半截态。"""
+    rows = conn.execute(
+        """
+        SELECT id, microstrain
+        FROM strain_readings
+        WHERE status = 'done'
+          AND (verdict IS NULL OR verdict NOT IN ('合格', '越界'))
+        ORDER BY id
+        """
+    ).fetchall()
+    for row in rows:
+        verdict, reason = judge_microstrain(float(row["microstrain"]))
+        conn.execute(
+            """
+            UPDATE strain_readings
+            SET verdict = %s, reason = %s, processed_at = now()
+            WHERE id = %s
+            """,
+            (verdict, reason, row["id"]),
+        )
+    conn.commit()
+    return len(rows)
 
 
 def run_once(conn) -> bool:
@@ -68,6 +88,9 @@ def main() -> None:
     with connect_sync() as conn:
         ensure_schema_sync(conn)
         seed_if_empty_sync(conn)
+        repaired = repair_half_judged(conn)
+        if repaired:
+            print(f"worker repaired {repaired} half-judged reading(s)", flush=True)
         conn.commit()
 
     while True:
